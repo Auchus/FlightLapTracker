@@ -1,0 +1,22 @@
+﻿<Window x:Class="FlightLapTracker.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Пилот Трекер" Height="400" Width="600">
+    <Grid Margin="10">
+        <StackPanel>
+            <TextBlock Text="Статус:" FontWeight="Bold"/>
+            <TextBlock x:Name="StatusText" Text="Ожидание начала..." Margin="0,5"/>
+
+            <TextBlock Text="Обратный отсчет:" FontWeight="Bold" Margin="0,10,0,0"/>
+            <TextBlock x:Name="CountdownText" FontSize="36" HorizontalAlignment="Center" Text="3"/>
+
+            <Button Content="Начать тестовый запуск" Click="StartTestFlight_Click" Margin="0,20,0,0"/>
+
+            <TextBlock Text="Пилота 1 (Q):" Margin="0,10,0,0"/>
+            <ListBox x:Name="LapsListPilot1"/>
+
+            <TextBlock Text="Пилота 2 (P):" Margin="0,10,0,0"/>
+            <ListBox x:Name="LapsListPilot2"/>
+        </StackPanel>
+    </Grid>
+</Window>
