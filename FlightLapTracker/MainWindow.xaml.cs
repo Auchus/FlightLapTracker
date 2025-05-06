@@ -1,56 +1,74 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Media;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
-using DocumentFormat.OpenXml.Drawing;
 using FlightLapTracker.Helpers;
+using FlightLapTracker.Models;
 using FlightLapTracker.Services;
 
 namespace FlightLapTracker
 {
     public partial class MainWindow : Window
     {
-        private DispatcherTimer countDownTimer;
         private DispatcherTimer flightTimer;
+        private DispatcherTimer timeElapsedTimer;
         private int currentCount = 3;
         private TimeSpan flightTime = TimeSpan.FromSeconds(180);
-        private List<TimeSpan> lapsPilot1 = new List<TimeSpan>();
-        private List<TimeSpan> lapsPilot2 = new List<TimeSpan>();
         private Stopwatch flightStopwatch = new Stopwatch();
-        private DateTime? startTime; // Чтобы хранить начало полёта
-
-
-        private SoundPlayer startPlayer = new SoundPlayer("C:\\Users\\admin\\source\\repos\\FlightLapTracker\\FlightLapTracker\\Sounds\\start.wav");
-        private SoundPlayer warningPlayer = new SoundPlayer("C:\\Users\\admin\\source\\repos\\FlightLapTracker\\FlightLapTracker\\Sounds\\warning.wav");
-        private bool hasPlayedWarning = false;
-
+        private DateTime? startTime;
+        private Dictionary<int, DateTime?> lastKeyPressTime = new()
+        {
+            { 1, null },
+            { 2, null }
+        };
         private readonly TelegramBotService botService;
+        private List<Pilot> allPilotsHistory = new();
+        private bool isRaceMode = false;
+
+        private SoundPlayer soundPlayer = new();
 
         public MainWindow()
         {
             InitializeComponent();
             InitializeTimers();
+            LoadAllPilotsHistory();
             botService = new TelegramBotService();
             botService.PilotRegistered += OnPilotRegistered;
+        }
 
-
-
+        private void LoadAllPilotsHistory()
+        {
+            allPilotsHistory = ExcelExporter.LoadPilotsFromSheet();
+            var pilotsFromJson = PilotDataStore.Load();
+            allPilotsHistory.AddRange(pilotsFromJson.Where(p => !allPilotsHistory.Any(ep => ep.TelegramId == p.TelegramId)));
         }
 
         private void InitializeTimers()
         {
-            countDownTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            countDownTimer.Tick += CountDownTimer_Tick;
-
-            flightTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(0.1) }; // 10 раз в секунду
+            flightTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(0.1) };
             flightTimer.Tick += FlightTimer_Tick;
+            timeElapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            timeElapsedTimer.Tick += TimeElapsedTimer_Tick;
         }
 
         private void StartTestFlight_Click(object sender, RoutedEventArgs e)
         {
+            if (botService.RegisteredPilots.Count < 2)
+            {
+                MessageBox.Show("Нужно зарегистрировать минимум двух пилотов.");
+                return;
+            }
+
+            // ✅ Начинаем отсчёт
             StartCountdown();
+
+            // ✅ Проигрываем звук в отдельном потоке
+            Task.Run(() => PlaySound("C://Users//alexr//Source//Repos//FlightLapTracker//FlightLapTracker//Sounds//start.wav"));
         }
 
         private void StartCountdown()
@@ -59,42 +77,36 @@ namespace FlightLapTracker
             CountdownText.Text = currentCount.ToString();
             StatusText.Text = "Обратный отсчёт...";
 
-            // Проигрываем общий звук (3-2-1 + старт)
-            startPlayer.Play();
-
-            // Создаём таймер для обновления текста на экране
             var updateTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            updateTimer.Tick += (s, e) =>
+
+            EventHandler tickHandler = null;
+            tickHandler = (s, args) =>
             {
                 currentCount--;
+                CountdownText.Text = currentCount.ToString();
 
-                if (currentCount > 0)
-                {
-                    CountdownText.Text = currentCount.ToString();
-                }
-                else
+                if (currentCount <= 0)
                 {
                     updateTimer.Stop();
+                    updateTimer.Tick -= tickHandler;
                     StartFlight();
                 }
             };
 
+            updateTimer.Tick += tickHandler;
             updateTimer.Start();
         }
 
-        private void CountDownTimer_Tick(object sender, EventArgs e)
+        private void PlaySound(string path)
         {
-            if (currentCount > 0)
+            try
             {
-                startPlayer.Play();
-                currentCount--;
-                CountdownText.Text = currentCount.ToString();
+                using var player = new SoundPlayer(path);
+                player.PlaySync(); // Проигрываем синхронно, но в отдельном потоке
             }
-            else
+            catch (Exception ex)
             {
-                countDownTimer.Stop();
-                startPlayer.Play();
-                StartFlight();
+                Console.WriteLine($"Ошибка воспроизведения звука: {ex.Message}");
             }
         }
 
@@ -102,78 +114,118 @@ namespace FlightLapTracker
         {
             flightStopwatch.Restart();
             startTime = DateTime.Now;
-            hasPlayedWarning = false; // Сбрасываем флаг
-
             StatusText.Text = "Полёт начат!";
             CountdownText.Text = "Полёт...";
+            TimeElapsedText.Text = "Прошло времени: 00:00:00.000";
+
+            // Очищаем лист "Текущий полёт" перед началом
+            ExcelExporter.ClearSheet("Текущий полёт");
+
+            var currentPilots = botService.RegisteredPilots.Take(2).ToList();
+            ExcelExporter.ExportPilots(currentPilots, isRaceMode, "Текущий полёт");
+            HtmlExporter.ExportToHtml(ExcelExporter.LoadPilotsFromSheet());
+
             flightTimer.Start();
+            timeElapsedTimer.Start();
+        }
+
+        private void EndFlightEarly_Click(object sender, RoutedEventArgs e)
+        {
+            EndFlight();
+        }
+
+        private void EndFlight()
+        {
+            flightTimer.Stop();
+            flightStopwatch.Stop();
+            timeElapsedTimer.Stop();
+            StatusText.Text = "Полёт окончен.";
+
+            ExcelExporter.ExportPilots(botService.RegisteredPilots, isRaceMode);
+
+            allPilotsHistory = ExcelExporter.LoadPilotsFromSheet();
+            HtmlExporter.ExportToHtml(allPilotsHistory);
+        }
+
+        private void TimeElapsedTimer_Tick(object sender, EventArgs e)
+        {
+            if (flightStopwatch.IsRunning)
+            {
+                TimeElapsedText.Text = $"Прошло времени: {flightStopwatch.Elapsed:hh\\:mm\\:ss\\.fff}";
+
+                // За 10 секунд до конца
+                if (flightStopwatch.Elapsed >= flightTime.Subtract(TimeSpan.FromSeconds(10)))
+                {
+                    Task.Run(() => PlaySound("C://Users//alexr//Source//Repos//FlightLapTracker//FlightLapTracker//Sounds//waning.wav"));
+                }
+            }
         }
 
         private void FlightTimer_Tick(object sender, EventArgs e)
         {
             var elapsed = flightStopwatch.Elapsed;
-            var remaining = flightTime - elapsed;
-
-            if (remaining.TotalSeconds <= 10 && !hasPlayedWarning)
+            if (elapsed >= flightTime ||
+                (isRaceMode && botService.RegisteredPilots.Take(2).All(p => p.Laps.Count >= 2)) ||
+                (!isRaceMode && botService.RegisteredPilots.Take(2).All(p => p.Laps.Count >= 4)))
             {
-                warningPlayer.Play();
-                hasPlayedWarning = true; // Защита от повторного проигрывания
+                EndFlight();
             }
-
-            if (elapsed >= flightTime)
+            else if ((int)elapsed.TotalSeconds % 5 == 0)
             {
-                flightTimer.Stop();
-                flightStopwatch.Stop();
-                StatusText.Text = "Полёт окончен.";
+                var currentPilots = botService.RegisteredPilots.Take(2).ToList();
+                ExcelExporter.ExportPilots(currentPilots, isRaceMode, "Текущий полёт");
+                HtmlExporter.ExportToHtml(ExcelExporter.LoadPilotsFromSheet());
             }
-
-            HtmlExporter.ExportToHtml(botService.RegisteredPilots);
         }
 
         protected override void OnKeyDown(System.Windows.Input.KeyEventArgs e)
         {
             switch (e.Key)
             {
-                case System.Windows.Input.Key.Q:
-                    RecordLap(1);
-                    break;
-                case System.Windows.Input.Key.P:
-                    RecordLap(2);
-                    break;
+                case System.Windows.Input.Key.Q: RecordLap(1); break;
+                case System.Windows.Input.Key.P: RecordLap(2); break;
             }
             base.OnKeyDown(e);
         }
 
         private void RecordLap(int pilotNumber)
         {
-            if (!startTime.HasValue)
-                return;
+            if (!startTime.HasValue || botService.RegisteredPilots.Count < pilotNumber) return;
+            var pilot = botService.RegisteredPilots[pilotNumber - 1];
+            int maxLaps = isRaceMode ? 2 : 4;
+            if (pilot.Laps.Count >= maxLaps) return;
+            var now = DateTime.Now;
+            if (lastKeyPressTime[pilotNumber] is { } last && (now - last).TotalSeconds < 5) return;
+            var lapTime = flightStopwatch.Elapsed;
+            var newLap = new Lap(lapTime, pilot.Laps.LastOrDefault());
+            pilot.Laps.Add(newLap);
+            lastKeyPressTime[pilotNumber] = now;
 
-            var lapTime = flightStopwatch.Elapsed; // Используем точное время от начала полёта
-
-            if (pilotNumber == 1 && botService.RegisteredPilots.Count >= 1)
-            {
-                var pilot = botService.RegisteredPilots[0];
-                pilot.Laps.Add(lapTime);
-                LapsListPilot1.Items.Add(lapTime.ToString(@"hh\:mm\:ss\.fff"));
-
-                ExcelExporter.ExportNewLaps(new[] { pilot });
-            }
-            else if (pilotNumber == 2 && botService.RegisteredPilots.Count >= 2)
-            {
-                var pilot = botService.RegisteredPilots[1];
-                pilot.Laps.Add(lapTime);
-                LapsListPilot2.Items.Add(lapTime.ToString(@"hh\:mm\:ss\.fff"));
-
-                ExcelExporter.ExportNewLaps(new[] { pilot });
-            }
-        }
-        private void OnPilotRegistered(Pilot pilot)
-        {
             Dispatcher.Invoke(() =>
             {
-                MessageBox.Show($"Зарегистрирован пилот:\n{pilot.FullName} ({pilot.Channel})");
+                var lapsList = pilotNumber == 1 ? LapsListPilot1 : LapsListPilot2;
+                lapsList.Items.Clear();
+                pilot.Laps.ForEach(lap => lapsList.Items.Add($"{lap.Duration:hh\\:mm\\:ss\\.fff}"));
             });
+
+            var currentPilots = botService.RegisteredPilots.Take(2).ToList();
+            ExcelExporter.ExportPilots(currentPilots, isRaceMode, "Текущий полёт");
+            HtmlExporter.ExportToHtml(ExcelExporter.LoadPilotsFromSheet());
+        }
+
+        private void OnPilotRegistered(Pilot pilot) => Dispatcher.Invoke(() =>
+            MessageBox.Show($"Зарегистрирован пилот:\n{pilot.FullName} ({pilot.Channel})"));
+
+        private void QualificationMode_Click(object sender, RoutedEventArgs e)
+        {
+            isRaceMode = false;
+            StatusText.Text = "Режим: Квалификация (4 круга)";
+        }
+
+        private void RaceMode_Click(object sender, RoutedEventArgs e)
+        {
+            isRaceMode = true;
+            StatusText.Text = "Режим: Гонка (2 круга)";
         }
     }
 }

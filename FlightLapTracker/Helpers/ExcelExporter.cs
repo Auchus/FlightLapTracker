@@ -1,4 +1,5 @@
 ﻿using ClosedXML.Excel;
+using FlightLapTracker.Models;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -9,74 +10,191 @@ namespace FlightLapTracker.Helpers
     public static class ExcelExporter
     {
         private const string FilePath = "Results/laps.xlsx";
-        private const string SheetName = "Лапы";
 
-        /// <summary>
-        /// Экспортирует только новые лапы (те, которые ещё не были записаны)
-        /// </summary>
-        public static void ExportNewLaps(IEnumerable<Pilot> pilots)
+        public static void ClearSheet(string sheetName)
         {
-            foreach (var pilot in pilots)
+            if (!File.Exists(FilePath)) return;
+
+            using var workbook = new XLWorkbook(FilePath);
+            if (workbook.Worksheets.TryGetWorksheet(sheetName, out var worksheet))
             {
-                var newLaps = pilot.Laps.Skip(pilot.ExportedLapsCount).ToList();
-
-                if (!newLaps.Any())
-                    continue;
-
-                ExportLapsToFile(newLaps, pilot);
-                pilot.ExportedLapsCount += newLaps.Count;
+                foreach (var row in worksheet.RowsUsed().Skip(1)) row.Delete();
             }
+            workbook.Save();
         }
 
-        /// <summary>
-        /// Записывает указанные лапы в Excel-файл
-        /// </summary>
-        private static void ExportLapsToFile(List<TimeSpan> laps, Pilot pilot)
+
+        public static void ExportPilots(IEnumerable<Pilot> pilots, bool isRaceMode, string sheetName = null)
         {
-            bool fileExists = File.Exists(FilePath);
+            using var workbook = File.Exists(FilePath) ? new XLWorkbook(FilePath) : new XLWorkbook();
 
-            using var workbook = fileExists ? new XLWorkbook(FilePath) : new XLWorkbook();
-
-            IXLWorksheet worksheet;
-
-            // Проверяем, есть ли нужный лист
-            worksheet = workbook.Worksheets.FirstOrDefault(ws =>
-                ws.Name.Trim().Equals(SheetName, StringComparison.OrdinalIgnoreCase))
-                ?? workbook.Worksheets.Add(SheetName);
-
-            // Добавляем заголовки, если лист пустой
-            if (worksheet.LastRowUsed() == null)
+            if (sheetName == null)
             {
-                worksheet.Cell(1, 1).Value = "Пилот";
-                worksheet.Cell(1, 2).Value = "Никнейм";
-                worksheet.Cell(1, 3).Value = "Канал";
-                worksheet.Cell(1, 4).Value = "Дата";
-                worksheet.Cell(1, 5).Value = "Время лапа";
+                string mainSheetName = isRaceMode ? "Гонка" : "Лапы";
+                IXLWorksheet mainSheet = GetOrCreateWorksheet(workbook, mainSheetName);
 
-                worksheet.Row(1).Style.Font.Bold = true;
-                worksheet.Row(1).Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Center;
+                WriteHeaders(mainSheet, isRaceMode);
+
+                int lastRow = mainSheet.RowsUsed().Count() + 1;
+
+                foreach (var pilot in pilots)
+                {
+                    WritePilotData(mainSheet, lastRow++, pilot, isRaceMode);
+                }
+            }
+            else
+            {
+                IXLWorksheet tempSheet = GetOrCreateWorksheet(workbook, sheetName);
+
+                // ❌ Убираем удаление всех строк, кроме первой:
+                foreach (var row in tempSheet.RowsUsed().Skip(1)) row.Delete(); // ✅ Теперь удаляем только данные, не шапку
+
+                WriteHeaders(tempSheet, isRaceMode); // ✅ Переписываем заголовки (можно убрать, если они уже есть)
+
+                int lastRow = 2; // ✅ Начинаем с 2 строки
+
+                foreach (var pilot in pilots)
+                {
+                    WritePilotData(tempSheet, lastRow++, pilot, isRaceMode);
+                }
             }
 
-            // Начинаем запись данных после последней строки
-            int lastRow = worksheet.LastRowUsed()?.RowNumber() ?? 1;
-            int row = lastRow + 1;
-
-            foreach (var lap in laps)
-            {
-                worksheet.Cell(row, 1).Value = pilot.FullName;
-                worksheet.Cell(row, 2).Value = pilot.Nickname;
-                worksheet.Cell(row, 3).Value = pilot.Channel;
-                worksheet.Cell(row, 4).Value = DateTime.Now.ToString("dd.MM.yyyy");
-                worksheet.Cell(row, 5).Value = lap.ToString(@"hh\:mm\:ss\.fff");
-                worksheet.Cell(row, 5).Style.NumberFormat.Format = @"hh\:mm\:ss\.fff";
-
-
-                row++;
-            }
-
-            // Сохраняем изменения
-            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
             workbook.SaveAs(FilePath);
+        }
+
+        public static List<Pilot> LoadPilotsFromSheet()
+        {
+            if (!File.Exists(FilePath)) return new List<Pilot>();
+            using var workbook = new XLWorkbook(FilePath);
+            var pilots = new List<Pilot>();
+
+            foreach (var sheetName in new[] { "Лапы", "Гонка" })
+            {
+                if (!workbook.Worksheets.TryGetWorksheet(sheetName, out var worksheet)) continue;
+                bool isRace = sheetName == "Гонка";
+                int maxLaps = isRace ? 2 : 4;
+                foreach (var row in worksheet.RowsUsed().Skip(1))
+                {
+                    var fullName = row.Cell(1).GetString();
+                    if (string.IsNullOrWhiteSpace(fullName)) continue;
+                    var pilot = new Pilot
+                    {
+                        FullName = fullName,
+                        Nickname = row.Cell(2).GetString(),
+                        Channel = row.Cell(3).GetString()
+                    };
+                    if (long.TryParse(row.Cell(10).GetString(), out var id))
+                        pilot.TelegramId = id;
+                    TimeSpan totalTime = TimeSpan.Zero;
+                    for (int i = 0; i < maxLaps; i++)
+                    {
+                        if (TimeSpan.TryParse(row.Cell(5 + i).GetString(), out var duration))
+                        {
+                            totalTime += duration;
+                            pilot.Laps.Add(new Lap(totalTime, pilot.Laps.LastOrDefault()));
+                        }
+                    }
+                    pilots.Add(pilot);
+                }
+            }
+            return pilots;
+        }
+
+        public static List<Pilot> LoadPilotsFromSheet(string sheetName)
+        {
+            if (!File.Exists(FilePath)) return new List<Pilot>();
+            using var workbook = new XLWorkbook(FilePath);
+            if (!workbook.Worksheets.TryGetWorksheet(sheetName, out var worksheet)) return new List<Pilot>();
+
+            var pilots = new List<Pilot>();
+            bool isRace = sheetName == "Гонка";
+            int maxLaps = isRace ? 2 : 4;
+
+            foreach (var row in worksheet.RowsUsed().Skip(1))
+            {
+                var fullName = row.Cell(1).GetString();
+                if (string.IsNullOrWhiteSpace(fullName)) continue;
+                var pilot = new Pilot
+                {
+                    FullName = fullName,
+                    Nickname = row.Cell(2).GetString(),
+                    Channel = row.Cell(3).GetString()
+                };
+                if (long.TryParse(row.Cell(10).GetString(), out var id))
+                    pilot.TelegramId = id;
+                TimeSpan totalTime = TimeSpan.Zero;
+                for (int i = 0; i < maxLaps; i++)
+                {
+                    if (TimeSpan.TryParse(row.Cell(5 + i).GetString(), out var duration))
+                    {
+                        totalTime += duration;
+                        pilot.Laps.Add(new Lap(totalTime, pilot.Laps.LastOrDefault()));
+                    }
+                }
+                pilots.Add(pilot);
+            }
+            return pilots;
+        }
+
+        public static List<Pilot> LoadParticipantsFromSheet()
+        {
+            const string sheetName = "Участники";
+            if (!File.Exists(FilePath)) return new List<Pilot>();
+            using var workbook = new XLWorkbook(FilePath);
+            if (!workbook.Worksheets.TryGetWorksheet(sheetName, out var worksheet)) return new List<Pilot>();
+
+            var participants = new List<Pilot>();
+            foreach (var row in worksheet.RowsUsed().Skip(1))
+            {
+                var fullName = row.Cell(1).GetString();
+                if (string.IsNullOrWhiteSpace(fullName)) continue;
+                var pilot = new Pilot
+                {
+                    FullName = fullName,
+                    Nickname = row.Cell(2).GetString(),
+                    Channel = row.Cell(3).GetString()
+                };
+                participants.Add(pilot);
+            }
+            return participants;
+        }
+
+        private static void WritePilotData(IXLWorksheet sheet, int row, Pilot pilot, bool isRaceMode)
+        {
+            sheet.Cell(row, 1).Value = pilot.FullName;
+            sheet.Cell(row, 2).Value = pilot.Nickname;
+            sheet.Cell(row, 3).Value = pilot.Channel;
+            sheet.Cell(row, 4).Value = DateTime.Now.ToString("dd.MM.yyyy");
+            int maxLaps = isRaceMode ? 2 : 4;
+            for (int i = 0; i < pilot.Laps.Count && i < maxLaps; i++)
+            {
+                sheet.Cell(row, 5 + i).Value = pilot.Laps[i].Duration.ToString(@"hh\:mm\:ss\.fff");
+                sheet.Cell(row, 5 + i).Style.NumberFormat.Format = @"hh\:mm\:ss\.fff";
+            }
+            var bestLap = pilot.Laps.Count > 0 ? pilot.Laps.Min(l => l.Duration) : TimeSpan.Zero;
+            sheet.Cell(row, 9).Value = bestLap != TimeSpan.Zero ? bestLap.ToString(@"hh\:mm\:ss\.fff") : "";
+            sheet.Cell(row, 10).Value = pilot.TelegramId.ToString();
+        }
+
+        private static void WriteHeaders(IXLWorksheet worksheet, bool isRaceMode)
+        {
+            string[] headers = { "Пилот", "Никнейм", "Канал", "Дата" };
+            for (int i = 0; i < headers.Length; i++)
+                worksheet.Cell(1, i + 1).Value = headers[i];
+
+            int maxLaps = isRaceMode ? 2 : 4;
+            for (int i = 1; i <= maxLaps; i++)
+                worksheet.Cell(1, 4 + i).Value = $"Круг {i}";
+
+            worksheet.Cell(1, 9).Value = "Лучшее время";
+            worksheet.Cell(1, 10).Value = "TelegramId";
+            worksheet.Row(1).Style.Font.Bold = true;
+        }
+
+        private static IXLWorksheet GetOrCreateWorksheet(XLWorkbook workbook, string sheetName)
+        {
+            return workbook.Worksheets.FirstOrDefault(ws => ws.Name.Equals(sheetName)) ?? workbook.Worksheets.Add(sheetName);
         }
     }
 }

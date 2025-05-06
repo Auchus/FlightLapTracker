@@ -3,11 +3,9 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot;
+using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
-using Telegram.Bot.Polling;
-using Telegram.Bot.Exceptions;
-using DocumentFormat.OpenXml.Drawing.Charts;
 
 namespace FlightLapTracker.Services
 {
